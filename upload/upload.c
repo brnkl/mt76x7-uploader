@@ -52,7 +52,6 @@ void retryInitSequence(FlashState* s) {
   s->cCount = 0;
   s->errorCount = 0;
   s->startTime = util_getUnixDatetime();
-  close(s->serialPort);
   putIntoBootloader();
   configureSerialPort(s, MTK7697_BAUD);
 }
