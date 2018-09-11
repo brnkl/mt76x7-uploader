@@ -1,0 +1,27 @@
+sandboxed: false
+start: manual
+version: 2.14.0
+
+executables:
+{
+  mtkSetup = ( upload )
+}
+
+processes:
+{
+  run:
+  {
+    ( mtkSetup )
+  }
+  faultAction: restartApp
+  envVars:
+  {
+    LE_LOG_LEVEL = DEBUG
+  }
+}
+
+bindings:
+{
+  mtkSetup.upload.mtRst -> gpioService.le_gpioPin2
+  mtkSetup.upload.mtBootstrap -> gpioService.le_gpioPin24
+}

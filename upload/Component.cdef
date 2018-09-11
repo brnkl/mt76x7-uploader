@@ -1,0 +1,22 @@
+cflags:
+{
+  -std=gnu99
+  -I$BRNKL_ROOT/apps/util
+  -Wno-unused-but-set-variable
+}
+
+requires:
+{
+  api:
+  {
+    mtRst = le_gpio.api
+    mtBootstrap = le_gpio.api
+  }
+}
+
+sources:
+{
+  upload.c
+  xmodem.c
+  $BRNKL_ROOT/apps/util/util.c
+}
