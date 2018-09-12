@@ -18,5 +18,6 @@ sources:
 {
   upload.c
   xmodem.c
+  crc16.c
   $BRNKL_ROOT/apps/util/util.c
 }
