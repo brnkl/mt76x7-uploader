@@ -2,6 +2,7 @@
 #include "interfaces.h"
 #include "xmodem.h"
 #include "util.h"
+#include <sys/mman.h>
 
 #define MTK7697_BAUD 115200
 #define MTK7697_BAUDX 115200 * 8
@@ -24,6 +25,32 @@ typedef struct {
 
 FlashState state = {0, 0, 0, 0};
 
+uint8_t _inbyte(unsigned short timeout) {
+  uint8_t x;
+  if (read(state.serialPort, &x, 1) != 1)
+    return -1;
+
+  LE_INFO("in: %c", x);
+  return x;
+}
+
+void _outbyte(uint8_t c) {
+  LE_INFO("out: %c", c);
+  write(state.serialPort, &c, 1);
+}
+
+int xmodemSendFile(const char* filename) {
+  int fd = open(filename, O_RDONLY);
+  struct stat buf;
+  if (fstat(fd, &buf) != 0) {
+    return -1;
+  }
+  unsigned char* file = mmap(NULL, buf.st_size, PROT_READ, MAP_SHARED, fd, 0);
+  int r = xmodemTransmit(file, buf.st_size);
+  close(fd);
+  return r;
+}
+
 void configureSerialPort(FlashState* s, int baud) {
   close(s->serialPort);
   s->serialPort = fd_openSerial(SERIAL_PORT_PATH, baud);
@@ -32,8 +59,8 @@ void configureSerialPort(FlashState* s, int baud) {
 bool flashDa(FlashState* s) {
   configureSerialPort(&state, MTK7697_BAUD);
   LE_INFO("Sending DA over xmodem");
-  bool r = XSend(s->serialPort, DA_PATH) == 0;
-  LE_INFO("DA success: %d", r);
+  int r = xmodemSendFile(DA_PATH);
+  LE_INFO("DA bytes sent: %d", r);
   return r;
 }
 
@@ -118,7 +145,9 @@ bool flashBinary(FlashState* s, MtkMemorySegment segment, const char* binPath) {
   }
   fd_flush(s->serialPort);
   LE_INFO("Sending %s over xmodem", binPath);
-  bool r = XSend(s->serialPort, binPath) == 0;
+  // this returns how much data was sent,
+  // so for now check that it's over 0
+  bool r = xmodemSendFile(binPath) > 0;
   LE_INFO("%s success: %d", binPath, r);
   sleep(1);
   fd_puts(s->serialPort, "C\r");
