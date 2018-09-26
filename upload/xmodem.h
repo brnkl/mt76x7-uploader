@@ -3,8 +3,15 @@
 
 #include "legato.h"
 
-int xmodemTransmit(unsigned char* src, int srcsz);
-uint8_t _inbyte(unsigned short timeout);
-void _outbyte(uint8_t c);
+enum {
+  PROTOCOL_XMODEM,
+  PROTOCOL_YMODEM,
+};
+
+int outputFd;
+
+int xymodem_send(int serial_fd, const char* filename, int protocol, int wait);
+int open_serial(const char* path, int baud);
+int writeAndIntercept(int fd, const void* buf, size_t count);
 
 #endif

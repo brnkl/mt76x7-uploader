@@ -1,269 +1,212 @@
-/*
- * Copyright 2001-2010 Georges Menie (www.menie.org)
- * All rights reserved.
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- *     * Redistributions of source code must retain the above copyright
- *       notice, this list of conditions and the following disclaimer.
- *     * Redistributions in binary form must reproduce the above copyright
- *       notice, this list of conditions and the following disclaimer in the
- *       documentation and/or other materials provided with the distribution.
- *     * Neither the name of the University of California, Berkeley nor the
- *       names of its contributors may be used to endorse or promote products
- *       derived from this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND ANY
- * EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
- * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE REGENTS AND CONTRIBUTORS BE LIABLE FOR ANY
- * DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
- * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
- * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
- * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
-
-/* this code needs standard functions memcpy() and memset()
-   and input/output functions _inbyte() and _outbyte().
-   the prototypes of the input/output functions are:
-     int _inbyte(unsigned short timeout); // msec timeout
-     void _outbyte(int c);
- */
-
-#include "crc16.h"
 #include "xmodem.h"
+#include <termios.h>
+#include <sys/mman.h>
 
-#define SOH 0x01
-#define STX 0x02
-#define EOT 0x04
-#define ACK 0x06
-#define NAK 0x15
-#define CAN 0x18
-#define CTRLZ 0x1A
+#define X_STX 0x02
+#define X_ACK 0x06
+#define X_NAK 0x15
+#define X_EOF 0x04
 
-#define DLY_1S 1000
-#define MAXRETRANS 25
-#define TRANSMIT_XMODEM_1K
+#define min(a, b) ((a) < (b) ? (a) : (b))
 
-static int check(int crc, const unsigned char* buf, int sz) {
-  if (crc) {
-    unsigned short crc = crc16_ccitt(buf, sz);
-    unsigned short tcrc = (buf[sz] << 8) + buf[sz + 1];
-    if (crc == tcrc)
-      return 1;
-  } else {
-    int i;
-    unsigned char cks = 0;
-    for (i = 0; i < sz; ++i) {
-      cks += buf[i];
-    }
-    if (cks == buf[sz])
-      return 1;
+struct xmodem_chunk {
+  uint8_t start;
+  uint8_t block;
+  uint8_t block_neg;
+  uint8_t payload[1024];
+  uint16_t crc;
+} __attribute__((packed));
+
+#define CRC_POLY 0x1021
+
+int outputFd;
+
+int writeAndIntercept(int fd, const void* buf, size_t count) {
+  return write(fd, buf, count);
+}
+
+static uint16_t crc_update(uint16_t crc_in, int incr) {
+  uint16_t xor = crc_in >> 15;
+  uint16_t out = crc_in << 1;
+
+  if (incr)
+    out++;
+
+  if (xor)
+    out ^= CRC_POLY;
+
+  return out;
+}
+
+static uint16_t crc16(const uint8_t* data, uint16_t size) {
+  uint16_t crc, i;
+
+  for (crc = 0; size > 0; size--, data++)
+    for (i = 0x80; i; i >>= 1)
+      crc = crc_update(crc, *data & i);
+
+  for (i = 0; i < 16; i++)
+    crc = crc_update(crc, 0);
+
+  return crc;
+}
+
+static uint16_t swap16(uint16_t in) {
+  return (in >> 8) | ((in & 0xff) << 8);
+}
+
+int xymodem_send(int serial_fd, const char* filename, int protocol, int wait) {
+  size_t len;
+  int ret, fd;
+  uint8_t answer;
+  struct stat stat;
+  const uint8_t* buf;
+  uint8_t eof = X_EOF;
+  struct xmodem_chunk chunk;
+  int skip_payload = 0;
+
+  fd = open(filename, O_RDONLY);
+  if (fd < 0) {
+    perror("open");
+    return -errno;
   }
+
+  fstat(fd, &stat);
+  len = stat.st_size;
+  buf = mmap(NULL, len, PROT_READ, MAP_PRIVATE, fd, 0);
+  if (!buf) {
+    perror("mmap");
+    return -errno;
+  }
+
+  if (wait) {
+    printf("Waiting for receiver ping ...");
+    fflush(stdout);
+
+    do {
+      ret = read(serial_fd, &answer, sizeof(answer));
+      if (ret != sizeof(answer)) {
+        perror("read");
+        return -errno;
+      }
+    } while (answer != 'C');
+
+    printf("done.\n");
+  }
+
+  printf("Sending %s ", filename);
+
+  if (protocol == PROTOCOL_YMODEM) {
+    strncpy((char*)chunk.payload, filename, sizeof(chunk.payload));
+    chunk.block = 0;
+    skip_payload = 1;
+  } else {
+    chunk.block = 1;
+  }
+
+  chunk.start = X_STX;
+
+  while (len) {
+    printf("block block: %d", chunk.block);
+    size_t z = 0;
+    int next = 0;
+    char status;
+
+    if (!skip_payload) {
+      z = min(len, sizeof(chunk.payload));
+      memcpy(chunk.payload, buf, z);
+      memset(chunk.payload + z, 0x1a, sizeof(chunk.payload) - z);
+    } else {
+      skip_payload = 0;
+    }
+
+    chunk.crc = swap16(crc16(chunk.payload, sizeof(chunk.payload)));
+    chunk.block_neg = 0xff - chunk.block;
+
+    ret = writeAndIntercept(serial_fd, &chunk, sizeof(chunk));
+    if (ret != sizeof(chunk))
+      return -errno;
+
+    ret = read(serial_fd, &answer, sizeof(answer));
+    if (ret != sizeof(answer))
+      return -errno;
+    switch (answer) {
+      case X_NAK:
+        status = 'N';
+        break;
+      case X_ACK:
+        status = '.';
+        next = 1;
+        break;
+      default:
+        status = answer;
+        break;
+    }
+
+    printf("%c", status);
+    fflush(stdout);
+
+    if (next) {
+      chunk.block++;
+      len -= z;
+      buf += z;
+    }
+  }
+
+  ret = writeAndIntercept(serial_fd, &eof, sizeof(eof));
+  if (ret != sizeof(eof))
+    return -errno;
+
+  /* send EOT again for YMODEM */
+  if (protocol == PROTOCOL_YMODEM) {
+    ret = writeAndIntercept(serial_fd, &eof, sizeof(eof));
+    if (ret != sizeof(eof))
+      return -errno;
+  }
+
+  printf("done.\n");
 
   return 0;
 }
 
-static void flushinput(void) {
-  while (_inbyte(((DLY_1S)*3) >> 1) >= 0)
-    ;
-}
+int open_serial(const char* path, int baud) {
+  struct termios tty;
 
-int xmodemReceive(unsigned char* dest, int destsz) {
-  unsigned char
-      xbuff[1030]; /* 1024 for XModem 1k + 3 head chars + 2 crc + nul */
-  unsigned char* p;
-  int bufsz, crc = 0;
-  unsigned char trychar = 'C';
-  unsigned char packetno = 1;
-  int i, c, len = 0;
-  int retry, retrans = MAXRETRANS;
-
-  for (;;) {
-    for (retry = 0; retry < 16; ++retry) {
-      if (trychar)
-        _outbyte(trychar);
-      if ((c = _inbyte((DLY_1S) << 1)) >= 0) {
-        switch (c) {
-          case SOH:
-            bufsz = 128;
-            goto start_recv;
-          case STX:
-            bufsz = 1024;
-            goto start_recv;
-          case EOT:
-            flushinput();
-            _outbyte(ACK);
-            return len; /* normal end */
-          case CAN:
-            if ((c = _inbyte(DLY_1S)) == CAN) {
-              flushinput();
-              _outbyte(ACK);
-              return -1; /* canceled by remote */
-            }
-            break;
-          default:
-            break;
-        }
-      }
-    }
-    if (trychar == 'C') {
-      trychar = NAK;
-      continue;
-    }
-    flushinput();
-    _outbyte(CAN);
-    _outbyte(CAN);
-    _outbyte(CAN);
-    return -2; /* sync error */
-
-  start_recv:
-    if (trychar == 'C')
-      crc = 1;
-    trychar = 0;
-    p = xbuff;
-    *p++ = c;
-    for (i = 0; i < (bufsz + (crc ? 1 : 0) + 3); ++i) {
-      if ((c = _inbyte(DLY_1S)) < 0)
-        goto reject;
-      *p++ = c;
-    }
-
-    if (xbuff[1] == (unsigned char)(~xbuff[2]) &&
-        (xbuff[1] == packetno || xbuff[1] == (unsigned char)packetno - 1) &&
-        check(crc, &xbuff[3], bufsz)) {
-      if (xbuff[1] == packetno) {
-        register int count = destsz - len;
-        if (count > bufsz)
-          count = bufsz;
-        if (count > 0) {
-          memcpy(&dest[len], &xbuff[3], count);
-          len += count;
-        }
-        ++packetno;
-        retrans = MAXRETRANS + 1;
-      }
-      if (--retrans <= 0) {
-        flushinput();
-        _outbyte(CAN);
-        _outbyte(CAN);
-        _outbyte(CAN);
-        return -3; /* too many retry error */
-      }
-      _outbyte(ACK);
-      continue;
-    }
-  reject:
-    flushinput();
-    _outbyte(NAK);
+  int fd = open(path, O_RDWR | O_SYNC);
+  if (fd < 0) {
+    perror("open");
+    return -errno;
   }
-}
 
-int xmodemTransmit(unsigned char* src, int srcsz) {
-  unsigned char
-      xbuff[1030]; /* 1024 for XModem 1k + 3 head chars + 2 crc + nul */
-  int bufsz, crc = -1;
-  unsigned char packetno = 1;
-  int i, c, len = 0;
-  int retry;
-
-  for (;;) {
-    for (retry = 0; retry < 16; ++retry) {
-      if ((c = _inbyte((DLY_1S) << 1)) >= 0) {
-        switch (c) {
-          case 'C':
-            crc = 1;
-            goto start_trans;
-          case NAK:
-            crc = 0;
-            goto start_trans;
-          case CAN:
-            if ((c = _inbyte(DLY_1S)) == CAN) {
-              _outbyte(ACK);
-              flushinput();
-              return -1; /* canceled by remote */
-            }
-            break;
-          default:
-            break;
-        }
-      }
-    }
-    _outbyte(CAN);
-    _outbyte(CAN);
-    _outbyte(CAN);
-    flushinput();
-    return -2; /* no sync */
-
-    for (;;) {
-    start_trans:
-#ifdef TRANSMIT_XMODEM_1K
-      xbuff[0] = STX;
-      bufsz = 1024;
-#else
-      xbuff[0] = SOH;
-      bufsz = 128;
-#endif
-      xbuff[1] = packetno;
-      xbuff[2] = ~packetno;
-      c = srcsz - len;
-      if (c > bufsz)
-        c = bufsz;
-      if (c > 0) {
-        memset(&xbuff[3], 0, bufsz);
-        memcpy(&xbuff[3], &src[len], c);
-        if (c < bufsz)
-          xbuff[3 + c] = CTRLZ;
-        if (crc) {
-          unsigned short ccrc = crc16_ccitt(&xbuff[3], bufsz);
-          xbuff[bufsz + 3] = (ccrc >> 8) & 0xFF;
-          xbuff[bufsz + 4] = ccrc & 0xFF;
-        } else {
-          unsigned char ccks = 0;
-          for (i = 3; i < bufsz + 3; ++i) {
-            ccks += xbuff[i];
-          }
-          xbuff[bufsz + 3] = ccks;
-        }
-        for (retry = 0; retry < MAXRETRANS; ++retry) {
-          for (i = 0; i < bufsz + 4 + (crc ? 1 : 0); ++i) {
-            _outbyte(xbuff[i]);
-          }
-          if ((c = _inbyte(DLY_1S)) >= 0) {
-            switch (c) {
-              case ACK:
-                ++packetno;
-                len += bufsz;
-                goto start_trans;
-              case CAN:
-                if ((c = _inbyte(DLY_1S)) == CAN) {
-                  _outbyte(ACK);
-                  flushinput();
-                  return -1; /* canceled by remote */
-                }
-                break;
-              case NAK:
-              default:
-                break;
-            }
-          }
-        }
-        _outbyte(CAN);
-        _outbyte(CAN);
-        _outbyte(CAN);
-        flushinput();
-        return -4; /* xmit error */
-      } else {
-        for (retry = 0; retry < 10; ++retry) {
-          _outbyte(EOT);
-          if ((c = _inbyte((DLY_1S) << 1)) == ACK)
-            break;
-        }
-        flushinput();
-        return (c == ACK) ? len : -5;
-      }
-    }
+  memset(&tty, 0, sizeof(tty));
+  if (tcgetattr(fd, &tty) != 0) {
+    perror("tcgetattr");
+    return -errno;
   }
+
+  cfsetospeed(&tty, baud);
+  cfsetispeed(&tty, baud);
+
+  tty.c_cflag = (tty.c_cflag & ~CSIZE) | CS8;  // 8-bit chars
+  tty.c_iflag &= ~IGNBRK;                      // disable break processing
+  tty.c_lflag = 0;                             // no signaling chars, no echo,
+                                               // no canonical processing
+  tty.c_oflag = 0;                             // no remapping, no delays
+  tty.c_cc[VMIN] = 1;                          // read doesn't block
+  tty.c_cc[VTIME] = 5;                         // 0.5 seconds read timeout
+
+  tty.c_iflag &= ~(IXON | IXOFF | IXANY);  // shut off xon/xoff ctrl
+
+  tty.c_cflag |= (CLOCAL | CREAD);    // ignore modem controls,
+                                      // enable reading
+  tty.c_cflag &= ~(PARENB | PARODD);  // shut off parity
+  tty.c_cflag &= ~CSTOPB;
+  tty.c_cflag &= ~CRTSCTS;
+
+  if (tcsetattr(fd, TCSANOW, &tty) != 0) {
+    perror("tcsetattr");
+    return -errno;
+  }
+
+  return fd;
 }
