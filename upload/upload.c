@@ -5,7 +5,7 @@
 #include <sys/mman.h>
 
 #define MTK7697_BAUD 115200
-#define MTK7697_BAUDX 115200 * 8
+#define MTK7697_BAUDX 115200 * 2
 static const char* SERIAL_PORT_PATH = "/dev/ttyHS0";
 static const char* LDR_BIN_PATH = "/home/root/mtfiles/mt7697_bootloader.bin";
 static const char* N9_BIN_PATH =
@@ -23,45 +23,29 @@ typedef struct {
   int startTime;
 } FlashState;
 
-FlashState state = {0, 0, 0, 0};
+FlashState state = {-1, 0, 0, 0};
 
-uint8_t _inbyte(unsigned short timeout) {
-  uint8_t x;
-  if (read(state.serialPort, &x, 1) != 1)
-    return -1;
-
-  LE_INFO("in: %c", x);
-  return x;
-}
-
-void _outbyte(uint8_t c) {
-  LE_INFO("out: %c", c);
-  write(state.serialPort, &c, 1);
-}
-
-int xmodemSendFile(const char* filename) {
-  int fd = open(filename, O_RDONLY);
-  struct stat buf;
-  if (fstat(fd, &buf) != 0) {
-    return -1;
-  }
-  unsigned char* file = mmap(NULL, buf.st_size, PROT_READ, MAP_SHARED, fd, 0);
-  int r = xmodemTransmit(file, buf.st_size);
-  close(fd);
-  return r;
+bool xmodemSendFile(const char* filename) {
+  return !xymodem_send(state.serialPort, filename, PROTOCOL_XMODEM, false);
 }
 
 void configureSerialPort(FlashState* s, int baud) {
-  close(s->serialPort);
-  s->serialPort = fd_openSerial(SERIAL_PORT_PATH, baud);
+  if (s->serialPort != -1) {
+    close(s->serialPort);
+  }
+  s->serialPort = open_serial(SERIAL_PORT_PATH, fd_convertBaud(baud));
 }
 
 bool flashDa(FlashState* s) {
   configureSerialPort(&state, MTK7697_BAUD);
   LE_INFO("Sending DA over xmodem");
-  int r = xmodemSendFile(DA_PATH);
-  LE_INFO("DA bytes sent: %d", r);
+  bool r = xmodemSendFile(DA_PATH);
+  LE_INFO("DA success: %d", r);
   return r;
+}
+
+int putAndIntercept(int fd, const char* s) {
+  return writeAndIntercept(fd, s, strlen(s));
 }
 
 void putIntoBootloader() {
@@ -89,7 +73,7 @@ bool verifyInitSequence(FlashState* s) {
   s->startTime = util_getUnixDatetime();
   while (!initDone) {
     data = fd_getChar(s->serialPort);
-    fd_flush(s->serialPort);
+    fd_flushInput(s->serialPort);
     if (data == 'C') {
       s->cCount++;
       LE_INFO("Got a C");
@@ -122,19 +106,25 @@ bool flashBinary(FlashState* s, MtkMemorySegment segment, const char* binPath) {
   flashDa(s);
   configureSerialPort(s, MTK7697_BAUDX);
   sleep(1);
-  bool initDone = false;
-  int data = '0';
+  int bytesWritten = 0;
+  const char* memorySelection;
   switch (segment) {
     case LDR:
-      fd_puts(s->serialPort, "1\r");
-      break;
-    case N9:
-      fd_puts(s->serialPort, "3\r");
+      memorySelection = "1\r";
       break;
     case CM4:
-      fd_puts(s->serialPort, "2\r");
+      memorySelection = "2\r";
+      break;
+    case N9:
+      memorySelection = "3\r";
       break;
   }
+  bytesWritten = putAndIntercept(s->serialPort, memorySelection);
+  LE_INFO("Bytes written %d", bytesWritten);
+  fd_flush(s->serialPort);
+  fd_flushInput(s->serialPort);
+  bool initDone = false;
+  int data = '0';
   while (!initDone) {
     LE_INFO("here %c", data);
     data = fd_getChar(s->serialPort);
@@ -144,14 +134,15 @@ bool flashBinary(FlashState* s, MtkMemorySegment segment, const char* binPath) {
     }
   }
   fd_flush(s->serialPort);
+  fd_flushInput(s->serialPort);
   LE_INFO("Sending %s over xmodem", binPath);
-  // this returns how much data was sent,
-  // so for now check that it's over 0
-  bool r = xmodemSendFile(binPath) > 0;
+  putAndIntercept(s->serialPort, "\r\r\r");
+  bool r = xmodemSendFile(binPath);
   LE_INFO("%s success: %d", binPath, r);
   sleep(1);
-  fd_puts(s->serialPort, "C\r");
+  putAndIntercept(s->serialPort, "C\r");
   fd_flush(s->serialPort);
+  fd_flushInput(s->serialPort);
   return true;
 }
 
@@ -166,7 +157,7 @@ bool flashN9(FlashState* s) {
 }
 
 bool flashCm4(FlashState* s) {
-  LE_INFO("Flashing CM4");
+  LE_INFO("Flashing CM4 segment");
   return flashBinary(s, CM4, CM4_BIN_PATH);
 }
 
@@ -180,10 +171,15 @@ void configureGpio() {
 }
 
 COMPONENT_INIT {
+  char path[1024];
+  snprintf(path, 1024, "/home/root/outputdata%d", util_getUnixDatetime());
+  outputFd = open(path, O_RDWR | O_CREAT);
+  LE_INFO("Output fd %d", outputFd);
   configureGpio();
   flashLdr(&state);
   flashN9(&state);
   flashCm4(&state);
   resetPins();
   close(state.serialPort);
+  close(outputFd);
 }
