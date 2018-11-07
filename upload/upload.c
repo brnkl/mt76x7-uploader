@@ -67,7 +67,7 @@ void retryInitSequence(FlashState* s) {
   configureSerialPort(s, MTK7697_BAUD);
 }
 
-bool verifyInitSequence(FlashState* s) {
+bool mtk_verifyInitSequence(FlashState* s) {
   uint8_t data;
   bool initDone = false;
   s->startTime = util_getUnixDatetime();
@@ -101,7 +101,7 @@ bool verifyInitSequence(FlashState* s) {
 bool flashBinary(FlashState* s, MtkMemorySegment segment, const char* binPath) {
   putIntoBootloader();
   configureSerialPort(s, MTK7697_BAUD);
-  bool init = verifyInitSequence(s);
+  bool init = mtk_verifyInitSequence(s);
   LE_INFO("Init verified: %d", init);
   flashDa(s);
   configureSerialPort(s, MTK7697_BAUDX);
@@ -165,17 +165,17 @@ void resetPins() {
   mtBootstrap_Deactivate();
 }
 
-void configureGpio() {
+void mtk_configureGpio() {
   mtRst_SetPushPullOutput(MTRST_ACTIVE_HIGH, true);
   mtBootstrap_SetPushPullOutput(MTBOOTSTRAP_ACTIVE_HIGH, true);
 }
 
-COMPONENT_INIT {
+void mtk_init() {
   char path[1024];
   snprintf(path, 1024, "/home/root/outputdata%d", util_getUnixDatetime());
   outputFd = open(path, O_RDWR | O_CREAT);
   LE_INFO("Output fd %d", outputFd);
-  configureGpio();
+  mtk_configureGpio();
   flashLdr(&state);
   flashN9(&state);
   flashCm4(&state);
