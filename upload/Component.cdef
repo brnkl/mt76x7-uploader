@@ -16,6 +16,7 @@ requires:
 
 sources:
 {
+  init.c
   upload.c
   xmodem.c
   crc16.c
