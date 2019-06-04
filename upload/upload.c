@@ -15,6 +15,10 @@ static const char* DA_PATH = "/home/root/mtfiles/da97.bin";
 
 typedef enum { LDR = 1, N9 = 3, CM4 = 2 } MtkMemorySegment;
 
+ssize_t fd_getByte(int fd, uint8_t* data) {
+  return read(fd, data, 1);
+}
+
 typedef struct {
   int serialPort;
   int errorCount;
@@ -33,8 +37,8 @@ void configureSerialPort(FlashState* s, int baud) {
   if (s->serialPort != -1) {
     close(s->serialPort);
   }
-  s->serialPort = open_serial(SERIAL_PORT_PATH, fd_convertBaud(baud));
-}
+  s->serialPort = fd_openSerial(SERIAL_PORT_PATH, MTK7697_BAUD);
+} 
 
 bool flashDa(FlashState* s) {
   configureSerialPort(&state, MTK7697_BAUD);
@@ -67,34 +71,48 @@ void retryInitSequence(FlashState* s) {
   configureSerialPort(s, MTK7697_BAUD);
 }
 
+/**
+ * Read a response from the MT7697 over UART
+ * 
+ * This waits for data to be available on the 
+ * UART and checks for a 'C' (the xmodem 
+ * synchronization character). If a 'C" is
+ * received the connection is initialized 
+ * and the test is successful. The test will 
+ * resest 3 times on an interval of 4 seconds
+ * (3 seconds if the timeout for xmodem) if 
+ * a 'C' is not received, then the test will 
+ * fail and return an error. 
+ */
+
 bool mtk_verifyInitSequence(FlashState* s) {
   uint8_t data;
   bool initDone = false;
   s->startTime = util_getUnixDatetime();
-  while (!initDone) {
-    data = fd_getChar(s->serialPort);
-    fd_flushInput(s->serialPort);
-    if (data == 'C') {
+
+  while (!initDone){
+    ssize_t bytesRead = fd_getByte(s->serialPort, &data);
+    if (bytesRead > 0){
+      LE_INFO("Data read: %d %c", data, data);
+      if (data == 'C'){
       s->cCount++;
-      LE_INFO("Got a C");
-    } else if (data != 0) {
-      s->errorCount++;
-      LE_INFO("Got an error");
+      LE_INFO("Got a  C");
+      }
     }
     if (s->cCount > 1) {
       initDone = true;
       LE_INFO("Init done");
       break;
     }
-    if (s->errorCount > 3 || (util_getUnixDatetime() - s->startTime > 3)) {
-      LE_INFO("Retrying...");
+    if((util_getUnixDatetime() - s->startTime > 3) && data == 0){
+      LE_INFO("Retrying serial");
       retryInitSequence(s);
+      }
+    if (s->retry > 3){
+      LE_INFO("Cannot connect to MTK, abort test");
+      break; 
     }
-    if (s->retry > 3) {
-      LE_INFO("Aborting");
-      break;
-    }
-  }
+  } 
   return initDone;
 }
 
