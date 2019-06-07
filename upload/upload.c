@@ -37,7 +37,7 @@ void configureSerialPort(FlashState* s, int baud) {
   if (s->serialPort != -1) {
     close(s->serialPort);
   }
-  s->serialPort = fd_openSerial(SERIAL_PORT_PATH, MTK7697_BAUD);
+  s->serialPort = fd_openSerial(SERIAL_PORT_PATH, baud);
 } 
 
 bool flashDa(FlashState* s) {
@@ -104,7 +104,7 @@ bool mtk_verifyInitSequence(FlashState* s) {
       LE_INFO("Init done");
       break;
     }
-    if((util_getUnixDatetime() - s->startTime > 3) && data == 0){
+    if((util_getUnixDatetime() - s->startTime > 3) && data != 'C'){
       LE_INFO("Retrying serial");
       retryInitSequence(s);
       }
